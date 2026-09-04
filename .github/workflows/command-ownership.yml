@@ -1,0 +1,32 @@
+name: Verify command ownership
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-command-ownership:
+    name: Check command ownership
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify command ownership
+        run: pnpm run verify-command-ownership
