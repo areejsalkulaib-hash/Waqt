@@ -17,7 +17,7 @@ jobs:
   verify-owner-route:
     name: Open, deduplicate, and recover synthetic incidents
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

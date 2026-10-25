@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 INCIDENT_KEYS = (
@@ -23,6 +24,8 @@ INCIDENT_KEYS = (
 )
 DRILL_MARKER = "WAQT polling owner-route synthetic drill"
 API_VERSION = "2022-11-28"
+READ_ATTEMPTS = 13
+READ_DELAY_SECONDS = 5
 
 
 class DrillFailure(RuntimeError):
@@ -48,6 +51,7 @@ class GitHubClient:
                 "Authorization": f"Bearer {self.token}",
                 "X-GitHub-Api-Version": API_VERSION,
                 "User-Agent": "waqt-polling-owner-route-drill",
+                "Cache-Control": "no-cache",
             },
         )
         try:
@@ -93,19 +97,53 @@ def list_open_drill_issues(client: GitHubClient, incident_key: str) -> list[dict
     ]
 
 
-def emit_degraded(client: GitHubClient, incident_key: str) -> None:
+def wait_for_issue_list(
+    client: GitHubClient,
+    incident_key: str,
+    predicate: Callable[[list[dict[str, Any]]], bool],
+) -> list[dict[str, Any]]:
+    """Bound read-after-write lag without resubmitting a mutation."""
+    for attempt in range(READ_ATTEMPTS):
+        matches = list_open_drill_issues(client, incident_key)
+        if predicate(matches):
+            return matches
+        if attempt + 1 < READ_ATTEMPTS:
+            time.sleep(READ_DELAY_SECONDS)
+    raise DrillFailure(f"{incident_key} issue list did not reflect the write in time")
+
+
+def emit_degraded(
+    client: GitHubClient,
+    incident_key: str,
+    known_issues: list[dict[str, Any]],
+) -> None:
     matches = list_open_drill_issues(client, incident_key)
+    if known_issues:
+        known_numbers = {issue["number"] for issue in known_issues}
+        matches = wait_for_issue_list(
+            client, incident_key,
+            lambda items: known_numbers <= {issue["number"] for issue in items},
+        )
     if len(matches) > 1:
         raise DrillFailure(
             f"{incident_key} has {len(matches)} open synthetic incidents; expected one"
         )
     if not matches:
-        client.request(
+        created = client.request(
             "POST",
             "/issues",
             {"title": issue_title(incident_key), "body": issue_body(incident_key)},
         )
+        # Save the mutation result before waiting: cleanup must not depend on a
+        # list endpoint that may still return its pre-create response.
+        known_issues.append(created)
+        wait_for_issue_list(
+            client, incident_key,
+            lambda items: any(i["number"] == created["number"] for i in items),
+        )
         return
+    if not known_issues:
+        known_issues.extend(matches)
     client.request(
         "POST",
         f"/issues/{matches[0]['number']}/comments",
@@ -119,9 +157,19 @@ def emit_degraded(client: GitHubClient, incident_key: str) -> None:
     )
 
 
-def emit_healthy(client: GitHubClient, incident_key: str) -> None:
+def emit_healthy(
+    client: GitHubClient,
+    incident_key: str,
+    known_issues: list[dict[str, Any]],
+) -> None:
     matches = list_open_drill_issues(client, incident_key)
-    for issue in matches:
+    by_number = {issue["number"]: issue for issue in [*matches, *known_issues]}
+    for issue in by_number.values():
+        if (
+            issue.get("title") != issue_title(incident_key)
+            or DRILL_MARKER not in issue.get("body", "")
+        ):
+            raise DrillFailure("Refusing to close an unmarked synthetic incident")
         client.request(
             "POST",
             f"/issues/{issue['number']}/comments",
@@ -138,14 +186,20 @@ def emit_healthy(client: GitHubClient, incident_key: str) -> None:
             f"/issues/{issue['number']}",
             {"state": "closed", "state_reason": "completed"},
         )
+        # A stale empty list must not hide a failed close.
+        actual = client.request("GET", f"/issues/{issue['number']}")
+        if actual.get("state") != "closed":
+            raise DrillFailure(f"{incident_key} recovery left incident open")
+    wait_for_issue_list(client, incident_key, lambda items: not items)
 
 
 def run_drill(client: GitHubClient) -> None:
     failures: list[str] = []
     for incident_key in INCIDENT_KEYS:
+        known_issues: list[dict[str, Any]] = []
         try:
-            emit_degraded(client, incident_key)
-            emit_degraded(client, incident_key)
+            emit_degraded(client, incident_key, known_issues)
+            emit_degraded(client, incident_key, known_issues)
             open_after_repeat = list_open_drill_issues(client, incident_key)
             if len(open_after_repeat) != 1:
                 raise DrillFailure(
@@ -156,7 +210,7 @@ def run_drill(client: GitHubClient) -> None:
             failures.append(f"{incident_key} degraded/deduplication: {error}")
         finally:
             try:
-                emit_healthy(client, incident_key)
+                emit_healthy(client, incident_key, known_issues)
                 remaining = list_open_drill_issues(client, incident_key)
                 if remaining:
                     raise DrillFailure(
